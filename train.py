@@ -9,33 +9,40 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+# Standard Library Imports
 import os
-from datetime import datetime
-import torch
-import random
-import numpy as np
-from random import randint
-from utils.loss_utils import l1_loss, ssim, lncc, get_img_grad_weight
-from utils.graphics_utils import patch_offsets, patch_warp
-from gaussian_renderer import render, network_gui
-import sys, time
-from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
-import cv2
+import sys
+import time
 import uuid
-from tqdm import tqdm
-from utils.image_utils import psnr, erode
+import random
+from random import randint
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
-from scene.app_model import AppModel
-from scene.cameras import Camera
+
+# Third-Party Library Imports
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+
+# Torch-Specific Imports
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
-import time
-import torch.nn.functional as F
+
+# Local Application/Library Specific Imports
+from utils.loss_utils import l1_loss, l2_loss, ssim, lncc, get_img_grad_weight
+from utils.graphics_utils import patch_offsets, patch_warp
+from utils.general_utils import safe_state
+from utils.image_utils import psnr, erode
+from gaussian_renderer import render, network_gui
+from arguments import ModelParams, PipelineParams, OptimizationParams
+from scene import Scene, GaussianModel
+from scene.app_model import AppModel
+from scene.cameras import Camera
+
 
 def setup_seed(seed):
      torch.manual_seed(seed)
@@ -79,6 +86,7 @@ def gen_virtul_cam(cam, trans_noise=1.0, deg_noise=15.0):
     return virtul_cam
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     # backup main code
@@ -123,6 +131,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     debug_path = os.path.join(scene.model_path, "debug")
     os.makedirs(debug_path, exist_ok=True)
 
+    log_dir = "/ssd2/jhp/PGSR/log"
+    os.makedirs(log_dir, exist_ok=True)
+    # log_path = os.path.join(log_dir, "hp_search_iteration_scale_v3.log")
+    log_path = os.path.join(log_dir, "hp_search_dssim_mask_v3.log")
+    with open(log_path, "a") as f:
+        # f.write(f"===== Training for Iteration {args.iterations} & Scale {args.scale} =====\n")
+        f.write(f"===== Training for dssim {args.lambda_dssim} & mask {args.lambda_mask} =====\n")
+
     for iteration in range(first_iter, opt.iterations + 1):
         # if network_gui.conn == None:
         #     network_gui.try_connect()
@@ -150,7 +166,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        gt_image, gt_image_gray = viewpoint_cam.get_image()
+        gt_image, gt_image_gray, bkgd_mask, bound_mask = viewpoint_cam.get_image_dna() #dna
         if iteration > 1000 and opt.exposure_compensation:
             gaussians.use_app = True
 
@@ -160,19 +176,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, app_model=app_model,
-                            return_plane=iteration>opt.single_view_weight_from_iter, return_depth_normal=iteration>opt.single_view_weight_from_iter)
-        image, viewspace_point_tensor, visibility_filter, radii = \
-            render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+                            return_plane=True, return_depth_normal=iteration>opt.single_view_weight_from_iter)
+        # image, viewspace_point_tensor, visibility_filter, radii = \
+        #     render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        
+        # for mask loss
+        image, alpha, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["render_alpha"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
         # Loss
-        ssim_loss = (1.0 - ssim(image, gt_image))
-        if 'app_image' in render_pkg and ssim_loss < 0.5:
-            app_image = render_pkg['app_image']
-            Ll1 = l1_loss(app_image, gt_image)
-        else:
-            Ll1 = l1_loss(image, gt_image)
+        # ssim_loss = (1.0 - ssim(image, gt_image))
+        # if 'app_image' in render_pkg and ssim_loss < 0.5:
+        #     app_image = render_pkg['app_image']
+        #     Ll1 = l1_loss(app_image, gt_image)
+        # else:
+        #     Ll1 = l1_loss(image, gt_image)
+
+
+        # Loss (ours) — SSIM loss + mask loss
+        Ll1 = l1_loss(image.permute(1, 2, 0)[bound_mask == 1], gt_image.permute(1, 2, 0)[bound_mask == 1]) # rgb loss
+        x, y, w, h = cv2.boundingRect(bound_mask.cpu().numpy().astype(np.uint8))
+        img_pred = image[:, y:y + h, x:x + w]
+        img_gt = gt_image[:, y:y + h, x:x + w]
+        ssim_loss = 1.0 - ssim(img_pred, img_gt)
         image_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
         loss = image_loss.clone()
+        # add mask loss
+        mask_loss = l2_loss(alpha[bound_mask==1], bkgd_mask[bound_mask==1]) 
+        loss = image_loss + opt.lambda_mask * mask_loss
         
         # scale loss
         if visibility_filter.sum() > 0:
@@ -315,7 +345,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         grid = patch_warp(H_ref_to_neareast.reshape(-1,3,3), ori_pixels_patch)
                         grid[:, :, 0] = 2 * grid[:, :, 0] / (W - 1) - 1.0
                         grid[:, :, 1] = 2 * grid[:, :, 1] / (H - 1) - 1.0
-                        _, nearest_image_gray = nearest_cam.get_image()
+                        _, nearest_image_gray, _, _ = nearest_cam.get_image_dna() #dna
                         sampled_gray_val = F.grid_sample(nearest_image_gray[None], grid.reshape(1, -1, 1, 2), align_corners=True)
                         sampled_gray_val = sampled_gray_val.reshape(-1, total_patch_size)
                         
@@ -351,8 +381,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            if iteration % 500 == 0:
+                # debug_save_mask_images(iteration, viewpoint_cam, gt_image, alpha, debug_path)
+                debug_save_mask_images(iteration, viewpoint_cam, gt_image, alpha ,bound_mask, bkgd_mask,debug_path)
+                log_intermediate_metrics(scene, pipe, background, app_model, iteration, log_path)
+
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), app_model)
+            training_report(tb_writer, iteration, Ll1, mask_loss, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), app_model)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -425,9 +460,123 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, app_model):
+import os
+import cv2
+import numpy as np
+import torch
+
+def debug_save_mask_images(
+    iteration,
+    viewpoint_cam,
+    gt_image,     # [3,H,W], float in [0,1]
+    alpha,        # [1,H,W], float in [0,1]
+    bound_mask,   # [H,W],   0 or 1
+    bkgd_mask,    # [H,W],   0 or 1
+    debug_path
+):
+    """
+    Save a suite of images to help debug mask-related losses:
+      1) Ground truth image
+      2) Predicted alpha mask (grayscale)
+      3) Bound mask (grayscale)
+      4) Background mask (grayscale)
+      5) Overlay of alpha on top of GT
+    Args:
+        iteration     (int):   current training iteration
+        viewpoint_cam (Camera): camera or viewpoint info (for naming)
+        gt_image      (Tensor): ground truth color [3, H, W]
+        alpha         (Tensor): predicted mask/alpha [1, H, W]
+        bound_mask    (Tensor): bounding mask for the region of interest [H, W]
+        bkgd_mask     (Tensor): background mask used in the loss [H, W]
+        debug_path    (str):   directory in which to save files
+    """
+    base_filename = f"{iteration:06d}_{viewpoint_cam.image_name}"
+
+    # Convert ground truth to [H,W,3] BGR uint8 for OpenCV
+    gt_image_np = (
+        gt_image
+        .permute(1, 2, 0)              # [3,H,W] -> [H,W,3]
+        .clamp(0, 1)
+        .detach().cpu().numpy() * 255
+    ).astype(np.uint8)
+    gt_image_bgr = gt_image_np[:, :, [2, 1, 0]]  # RGB -> BGR for OpenCV
+
+    # Convert alpha to grayscale [H,W] uint8
+    alpha_np = (
+        alpha
+        .squeeze(0)   # [1,H,W] -> [H,W]
+        .clamp(0, 1)
+        .detach().cpu().numpy() * 255
+    ).astype(np.uint8)
+
+    # Convert bound_mask to grayscale [H,W] uint8
+    bound_mask_np = (
+        bound_mask
+        .float()
+        .detach().cpu().numpy() * 255
+    ).astype(np.uint8)
+
+    # Convert bkgd_mask to grayscale [H,W] uint8
+    bkgd_mask_np = (
+        bkgd_mask
+        .float()
+        .detach().cpu().numpy() * 255
+    ).astype(np.uint8)
+
+    # Create overlay of alpha on top of GT
+    # We’ll color the alpha region in red channel as an example
+    overlay_bgr = gt_image_bgr.copy()
+    colored_mask = np.zeros_like(overlay_bgr)
+    colored_mask[:, :, 2] = alpha_np  # place alpha in the Red channel
+    overlay_bgr = cv2.addWeighted(colored_mask, 0.5, overlay_bgr, 0.5, 0)
+
+    # Save everything
+    cv2.imwrite(os.path.join(debug_path, base_filename + "_gt.png"), gt_image_bgr)
+    cv2.imwrite(os.path.join(debug_path, base_filename + "_alpha.png"), alpha_np)
+    cv2.imwrite(os.path.join(debug_path, base_filename + "_bkgd_mask.png"), bkgd_mask_np)
+    cv2.imwrite(os.path.join(debug_path, base_filename + "_overlay.png"), overlay_bgr)
+
+    print(f"[DEBUG] Saved alpha and mask debug images at iteration {iteration}"
+          f" for view {viewpoint_cam.image_name}")
+
+def log_intermediate_metrics(scene, pipe, background, app_model, iteration, log_path):
+    test_cameras = scene.getTestCameras()
+    if len(test_cameras) == 0:
+        # fallback to using all train cameras
+        train_cameras = scene.getTrainCameras()
+        if len(train_cameras) == 0:
+            print("No cameras at all. Cannot compute metrics.")
+            return
+        test_cameras = train_cameras
+
+    psnr_val, ssim_val, l1_val = 0.0, 0.0, 0.0
+    for cam in test_cameras:
+        out = render(cam, scene.gaussians, pipe, background, app_model=app_model)
+        pred = out["render"].clamp(0,1)
+        gt, _, _, _ = cam.get_image_dna()
+        gt = gt.clamp(0,1).cuda()
+        l1_val  += l1_loss(pred, gt).mean().item()
+        psnr_val += psnr(pred, gt).mean().item()
+        ssim_val += ssim(pred, gt).mean().item()
+
+    n_cams = len(test_cameras)
+    psnr_val /= n_cams
+    ssim_val /= n_cams
+    l1_val   /= n_cams
+
+    # Append results to the log file
+    with open(log_path, "a") as f:
+        f.write(
+            f"[Iter {iteration}] PSNR={psnr_val:.4f}, "
+            f"SSIM={ssim_val:.4f}, "
+            f"L1={l1_val:.5f}\n"
+        )
+
+
+def training_report(tb_writer, iteration, Ll1, mask_loss, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, app_model):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/mask_loss', mask_loss.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
@@ -447,7 +596,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     if 'app_image' in out:
                         image = out['app_image']
                     image = torch.clamp(image, 0.0, 1.0)
-                    gt_image, _ = viewpoint.get_image()
+                    gt_image, _, _, _ = viewpoint.get_image_dna()
                     gt_image = torch.clamp(gt_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
@@ -478,8 +627,9 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6007)
     parser.add_argument('--debug_from', type=int, default=-100)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 4_000])
+    # parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 4_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 2_000, 3_000, 4_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)

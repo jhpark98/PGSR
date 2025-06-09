@@ -48,6 +48,8 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+        elif 'dna' in args.source_path:
+            scene_info = sceneLoadTypeCallbacks["DNA"](args.source_path, args.images, args.eval)
         else:
             assert False, "Could not recognize scene type!"
 
@@ -131,8 +133,38 @@ class Scene:
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"), mask)
 
+        # Save GS points in pcd to test for TRELLIS
+        xyz = self.gaussians.get_xyz  # (N, 3)
+        if mask is not None:
+            xyz = xyz[mask]
+        save_pcd(xyz, os.path.join(point_cloud_path, "point_cloud.pcd"))
+
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+    
+def save_pcd(points: torch.Tensor, filename: str):
+    """
+    Save 3D points to a .pcd file (ASCII format).
+
+    Args:
+        points (torch.Tensor): (N, 3) tensor of 3D points
+        filename (str): Path to save the .pcd file
+    """
+    points_np = points.detach().cpu().numpy()
+    with open(filename, 'w') as f:
+        f.write("# .PCD v0.7 - Point Cloud Data file format\n")
+        f.write("VERSION 0.7\n")
+        f.write("FIELDS x y z\n")
+        f.write("SIZE 4 4 4\n")
+        f.write("TYPE F F F\n")
+        f.write("COUNT 1 1 1\n")
+        f.write(f"WIDTH {points_np.shape[0]}\n")
+        f.write("HEIGHT 1\n")
+        f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
+        f.write(f"POINTS {points_np.shape[0]}\n")
+        f.write("DATA ascii\n")
+        for pt in points_np:
+            f.write(f"{pt[0]} {pt[1]} {pt[2]}\n")

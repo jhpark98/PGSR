@@ -104,76 +104,97 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = PlaneGaussianRasterizer(raster_settings=raster_settings)
 
+    # If we don't need plane geometry outputs (depth, normal, etc.), just render color
     if not return_plane:
         rendered_image, radii, out_observe, _, _ = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            means2D_abs = means2D_abs,
-            shs = shs,
-            colors_precomp = colors_precomp,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
-        
-        return_dict =  {"render": rendered_image,
-                        "viewspace_points": screenspace_points,
-                        "viewspace_points_abs": screenspace_points_abs,
-                        "visibility_filter" : radii > 0,
-                        "radii": radii,
-                        "out_observe": out_observe}
+            means3D=means3D,
+            means2D=means2D,
+            means2D_abs=means2D_abs,
+            shs=shs,
+            colors_precomp=colors_precomp,
+            opacities=opacity,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=cov3D_precomp
+        )
+
+        return_dict = {
+            "render": rendered_image,
+            "viewspace_points": screenspace_points,
+            "viewspace_points_abs": screenspace_points_abs,
+            "visibility_filter": (radii > 0),
+            "radii": radii,
+            "out_observe": out_observe
+        }
+
+        # If appearance/exposure compensation is in use
         if app_model is not None and pc.use_app:
             appear_ab = app_model.appear_ab[torch.tensor(viewpoint_camera.uid).cuda()]
             app_image = torch.exp(appear_ab[0]) * rendered_image + appear_ab[1]
             return_dict.update({"app_image": app_image})
+
         return return_dict
 
-    global_normal = pc.get_normal(viewpoint_camera)
-    local_normal = global_normal @ viewpoint_camera.world_view_transform[:3,:3]
-    pts_in_cam = means3D @ viewpoint_camera.world_view_transform[:3,:3] + viewpoint_camera.world_view_transform[3,:3]
-    depth_z = pts_in_cam[:, 2]
+    # Otherwise, also compute geometry (plane-based depth + local normals)
+    global_normal = pc.get_normal(viewpoint_camera)  # [N, 3]
+    local_normal = global_normal @ viewpoint_camera.world_view_transform[:3, :3]  # [N, 3]
+    pts_in_cam = means3D @ viewpoint_camera.world_view_transform[:3, :3] + viewpoint_camera.world_view_transform[3, :3]
     local_distance = (local_normal * pts_in_cam).sum(-1).abs()
-    input_all_map = torch.zeros((means3D.shape[0], 5)).cuda().float()
+
+    # For each point, store up to 5 extra attributes to rasterize into buffers:
+    # (nx, ny, nz, alpha=1.0, distance)
+    input_all_map = torch.zeros((means3D.shape[0], 5), device=means3D.device, dtype=torch.float32)
     input_all_map[:, :3] = local_normal
     input_all_map[:, 3] = 1.0
     input_all_map[:, 4] = local_distance
 
+    # Render with geometry
     rendered_image, radii, out_observe, out_all_map, plane_depth = rasterizer(
-        means3D = means3D,
-        means2D = means2D,
-        means2D_abs = means2D_abs,
-        shs = shs,
-        colors_precomp = colors_precomp,
-        opacities = opacity,
-        scales = scales,
-        rotations = rotations,
-        all_map = input_all_map,
-        cov3D_precomp = cov3D_precomp)
+        means3D=means3D,
+        means2D=means2D,
+        means2D_abs=means2D_abs,
+        shs=shs,
+        colors_precomp=colors_precomp,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        all_map=input_all_map,
+        cov3D_precomp=cov3D_precomp
+    )
 
+    # out_all_map has shape [C,H,W] with C=5 => [nx, ny, nz, alpha, distance]
     rendered_normal = out_all_map[0:3]
-    rendered_alpha = out_all_map[3:4, ]
-    rendered_distance = out_all_map[4:5, ]
-    
-    return_dict =  {"render": rendered_image,
-                    "viewspace_points": screenspace_points,
-                    "viewspace_points_abs": screenspace_points_abs,
-                    "visibility_filter" : radii > 0,
-                    "radii": radii,
-                    "out_observe": out_observe,
-                    "rendered_normal": rendered_normal,
-                    "plane_depth": plane_depth,
-                    "rendered_distance": rendered_distance
-                    }
-    
+    rendered_alpha = out_all_map[3:4]
+    rendered_distance = out_all_map[4:5]
+
+    return_dict = {
+        "render": rendered_image,
+        "viewspace_points": screenspace_points,
+        "viewspace_points_abs": screenspace_points_abs,
+        "visibility_filter": (radii > 0),
+        "radii": radii,
+        "out_observe": out_observe,
+        "rendered_normal": rendered_normal,
+        "plane_depth": plane_depth,
+        "rendered_distance": rendered_distance,
+        # Provide an explicit 'render_alpha' key for the training script:
+        "render_alpha": rendered_alpha.squeeze(0)
+    }
+
+    # Apply appearance/exposure compensation if needed
     if app_model is not None and pc.use_app:
         appear_ab = app_model.appear_ab[torch.tensor(viewpoint_camera.uid).cuda()]
         app_image = torch.exp(appear_ab[0]) * rendered_image + appear_ab[1]
-        return_dict.update({"app_image": app_image})   
+        return_dict.update({"app_image": app_image})
 
+    # If the caller requests a normal map derived purely from the plane_depth,
+    # compute that and mask it by the alpha.
     if return_depth_normal:
-        depth_normal = render_normal(viewpoint_camera, plane_depth.squeeze()) * (rendered_alpha).detach()
+        depth_normal = render_normal(
+            viewpoint_cam=viewpoint_camera,
+            depth=plane_depth.squeeze(),
+            scale=1
+        ) * rendered_alpha.detach()
         return_dict.update({"depth_normal": depth_normal})
-    
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-    # They will be excluded from value updates used in the splitting criteria.
+
     return return_dict

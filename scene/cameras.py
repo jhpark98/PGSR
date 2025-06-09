@@ -54,7 +54,7 @@ class Camera(nn.Module):
                  image_path, image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, 
                  ncc_scale=1.0,
-                 preload_img=True, data_device = "cuda"
+                 preload_img=True, data_device = "cuda", image=None, gray_image=None, bkgd_mask=None, bound_mask=None,
                  ):
         super(Camera, self).__init__()
         self.uid = uid
@@ -65,6 +65,10 @@ class Camera(nn.Module):
         self.T = T
         self.FoVx = FoVx
         self.FoVy = FoVy
+        self.image = image
+        self.bkgd_mask = bkgd_mask
+        self.bound_mask = bound_mask
+        self.gray_image = gray_image
         self.image_name = image_name
         self.image_path = image_path
         self.image_width = image_width
@@ -82,7 +86,8 @@ class Camera(nn.Module):
             self.data_device = torch.device("cuda")
 
         self.original_image, self.image_gray, self.mask = None, None, None
-        self.preload_img = preload_img
+        # self.preload_img = preload_img
+        self.preload_img = False
         self.ncc_scale = ncc_scale
         if self.preload_img:
             gt_image, gray_image, loaded_mask = process_image(self.image_path, self.resolution, ncc_scale)
@@ -105,10 +110,14 @@ class Camera(nn.Module):
 
     def get_image(self):
         if self.preload_img:
-            return self.original_image.cuda(), self.original_image_gray.cuda()
+            return self.original_image, self.original_image_gray
         else:
             gt_image, gray_image, _ = process_image(self.image_path, self.resolution, self.ncc_scale)
             return gt_image.cuda(), gray_image.cuda()
+
+    def get_image_dna(self):
+        return torch.from_numpy(self.image).cuda(), torch.from_numpy(self.gray_image).cuda(), \
+                torch.from_numpy(np.array(self.bkgd_mask)).cuda()/255., torch.from_numpy(np.array(self.bound_mask)).cuda()/255.
 
     def get_calib_matrix_nerf(self, scale=1.0):
         intrinsic_matrix = torch.tensor([[self.Fx/scale, 0, self.Cx/scale], [0, self.Fy/scale, self.Cy/scale], [0, 0, 1]]).float()

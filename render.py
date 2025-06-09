@@ -63,11 +63,14 @@ def post_process_mesh(mesh, cluster_to_keep=1):
     return mesh_0
 
 def render_set(model_path, name, iteration, views, scene, gaussians, pipeline, background, 
-               app_model=None, max_depth=5.0, volume=None, use_depth_filter=False):
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    render_depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders_depth")
-    render_normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders_normal")
+               app_model=None, max_depth=5.0, volume=None, use_depth_filter=False, voxel_size=0.002):
+    # Create parameter-specific directory name
+    param_dir = f"md_{max_depth}_vs_{voxel_size}"
+    
+    gts_path = os.path.join(model_path, name, param_dir, "gt")
+    render_path = os.path.join(model_path, name, param_dir, "renders")
+    render_depth_path = os.path.join(model_path, name, param_dir, "renders_depth")
+    render_normal_path = os.path.join(model_path, name, param_dir, "renders_normal")
 
     makedirs(gts_path, exist_ok=True)
     makedirs(render_path, exist_ok=True)
@@ -76,7 +79,8 @@ def render_set(model_path, name, iteration, views, scene, gaussians, pipeline, b
 
     depths_tsdf_fusion = []
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        gt, _ = view.get_image()
+
+        gt, _, _, _ = view.get_image_dna()
         out = render(view, gaussians, pipeline, background, app_model=app_model)
         rendering = out["render"].clamp(0.0, 1.0)
         _, H, W = rendering.shape
@@ -153,13 +157,15 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         if not skip_train:
             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), scene, gaussians, pipeline, background, 
-                       max_depth=max_depth, volume=volume, use_depth_filter=use_depth_filter)
+                       max_depth=max_depth, volume=volume, use_depth_filter=use_depth_filter, voxel_size=voxel_size)
             print(f"extract_triangle_mesh")
             mesh = volume.extract_triangle_mesh()
 
-            path = os.path.join(dataset.model_path, "mesh")
+            # Create parameter-specific mesh directory
+            param_dir = f"md_{max_depth}_vs_{voxel_size}"
+            path = os.path.join(dataset.model_path, "mesh", param_dir)
             os.makedirs(path, exist_ok=True)
-            
+
             o3d.io.write_triangle_mesh(os.path.join(path, "tsdf_fusion.ply"), mesh, 
                                        write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
             
@@ -168,7 +174,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
                                        write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
 
         if not skip_test:
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), scene, gaussians, pipeline, background)
+            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), scene, gaussians, pipeline, background,
+                      max_depth=max_depth, voxel_size=voxel_size)
 
 if __name__ == "__main__":
     torch.set_num_threads(8)

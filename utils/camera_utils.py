@@ -39,7 +39,7 @@ def loadCam(args, id, cam_info, resolution_scale):
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
     sys.stdout.write('\r')
-    sys.stdout.write("load camera {}".format(id))
+    # sys.stdout.write("load camera {}\n".format(id))
     sys.stdout.flush()
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
@@ -47,7 +47,11 @@ def loadCam(args, id, cam_info, resolution_scale):
                   image_width=resolution[0], image_height=resolution[1],
                   image_path=cam_info.image_path,
                   image_name=cam_info.image_name, uid=cam_info.global_id, 
-                  preload_img=args.preload_img, 
+                  preload_img=args.preload_img,
+                  image=cam_info.image,
+                  gray_image=cam_info.gray_image,
+                  bkgd_mask=cam_info.bkgd_mask,
+                  bound_mask=cam_info.bound_mask,
                   ncc_scale=args.ncc_scale,
                   data_device=args.data_device)
 
